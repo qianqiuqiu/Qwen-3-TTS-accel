@@ -1,4 +1,4 @@
-# qwen3tts-accel
+# Qwen-3-TTS-accel
 
 [English README](./README.md)
 
