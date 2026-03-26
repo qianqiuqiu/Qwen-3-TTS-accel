@@ -1,4 +1,4 @@
-# Qwen-3-tts-accel
+# Qwen-3-TTS-accel
 
 [中文说明](./README_ZH.md)
 
