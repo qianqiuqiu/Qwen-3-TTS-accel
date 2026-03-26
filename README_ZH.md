@@ -1,6 +1,6 @@
 # qwen3tts-accel
 
-[![English README](https://img.shields.io/badge/README-English-blue)](./README.md)
+[English README](./README.md)
 
 ## 作者为什么做这个
 

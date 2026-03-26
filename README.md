@@ -1,6 +1,6 @@
 # qwen3tts-accel
 
-[![中文说明](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-blue)](./README_ZH.md)
+[中文说明](./README_ZH.md)
 
 ## Why this exists
 
