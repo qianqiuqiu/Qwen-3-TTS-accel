@@ -168,7 +168,7 @@ def test_create_app_registers_sync_route_handlers():
                 "model_path": "/tmp/model",
                 "sample_rate": 24000,
                 "device": "cuda:0",
-                "main_talker": "vllm_plugin",
+                "main_talker": "direct_sdpa",
                 "subtalker": "cuda_graph",
             }
 

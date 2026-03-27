@@ -11,6 +11,7 @@ def test_optimization_package_exists():
     assert (package_root / "subtalker").is_dir()
     assert (package_root / "vllm").is_dir()
     assert (package_root / "benchmarks").is_dir()
+    assert (package_root / "direct").is_dir()
 
 
 def test_service_layer_package_removed():

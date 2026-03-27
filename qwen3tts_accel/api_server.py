@@ -102,10 +102,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
-    parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--sample-rate", type=int, default=24000)
+    parser.add_argument("--max-seq-len", type=int, default=4096)
+    parser.add_argument("--no-cuda-graph-subtalker", action="store_true")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -116,10 +115,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     pipeline = Qwen3TTSAccelPipeline.from_pretrained(
         model_path=args.model_path,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_num_seqs=args.max_num_seqs,
         sample_rate=args.sample_rate,
+        max_seq_len=args.max_seq_len,
+        apply_cuda_graph_subtalker=not args.no_cuda_graph_subtalker,
     )
     app = create_app(pipeline, api_key=args.api_key)
     uvicorn.run(app, host=args.host, port=args.port)

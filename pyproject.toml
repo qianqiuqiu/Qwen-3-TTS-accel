@@ -51,6 +51,9 @@ all = [
 Homepage = "https://github.com/yijie-huang/qwen3-tts-streaming"
 Repository = "https://github.com/yijie-huang/qwen3-tts-streaming"
 
+[project.entry-points."vllm.general_plugins"]
+qwen3tts_accel = "qwen3tts_accel.vllm:register_qwen3_tts_model"
+
 [tool.setuptools.packages.find]
 include = ["qwen3tts_accel*"]
 

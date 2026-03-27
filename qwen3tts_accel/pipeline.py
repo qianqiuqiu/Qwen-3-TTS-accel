@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -8,8 +9,8 @@ import numpy as np
 
 from .audio import waveform_to_pcm_s16le_bytes, waveform_to_wav_bytes
 from .preprocess import Qwen3TTSPreprocessor
-from .subtalker import patch_code_predictor_cuda_graph
-from .vllm import VllmEngineConfig, create_vllm_runner, register_qwen3_tts_model
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_cuda_available() -> None:
@@ -28,20 +29,16 @@ class Qwen3TTSAccelPipeline:
         *,
         model_path: str,
         model: Any,
-        tokenizer: Any,
         preprocessor: Qwen3TTSPreprocessor,
-        subtalker_runner: Any,
-        vllm_runner: Any,
+        runner: Any,
         sample_rate: int,
         device: str,
     ) -> None:
         self.model_path = model_path
         self.model_name = Path(model_path).name
         self.model = model
-        self.tokenizer = tokenizer
         self.preprocessor = preprocessor
-        self.subtalker_runner = subtalker_runner
-        self.vllm_runner = vllm_runner
+        self.runner = runner
         self.sample_rate = sample_rate
         self.device = device
 
@@ -50,56 +47,40 @@ class Qwen3TTSAccelPipeline:
         cls,
         *,
         model_path: str,
-        tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.85,
-        max_num_seqs: int = 8,
         sample_rate: int = 24000,
+        max_seq_len: int = 4096,
+        apply_cuda_graph_subtalker: bool = True,
     ) -> "Qwen3TTSAccelPipeline":
         import torch
         from qwen_tts import Qwen3TTSModel
-        from transformers import AutoTokenizer
 
         ensure_cuda_available()
-        register_qwen3_tts_model()
 
         device = "cuda:0"
         dtype = torch.bfloat16
-        attn_impl = "sdpa"
         model = Qwen3TTSModel.from_pretrained(
             model_path,
             device_map=device,
             dtype=dtype,
-            attn_implementation=attn_impl,
-        )
-        tokenizer = getattr(model, "processor", None) or AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True,
+            attn_implementation="sdpa",
         )
 
-        preprocessor = Qwen3TTSPreprocessor(model=model, tokenizer=tokenizer)
-        subtalker_runner = patch_code_predictor_cuda_graph(model.model.talker, max_batch_size=1, capture=True)
+        preprocessor = Qwen3TTSPreprocessor(model=model)
 
-        codec_decoder = _build_codec_decoder_from_model(model.model if hasattr(model, "model") else model)
-        vllm_config = VllmEngineConfig(
-            model_path=model_path,
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_num_seqs=max_num_seqs,
-            sample_rate=sample_rate,
-            codec_decoder=codec_decoder,
-            helper_model=model,
+        from .direct import create_main_talker_runner
+
+        runner = create_main_talker_runner(
+            model,
+            max_seq_len=max_seq_len,
+            max_batch_size=1,
+            apply_cuda_graph_subtalker=apply_cuda_graph_subtalker,
         )
-        vllm_runner = create_vllm_runner(vllm_config)
-        if vllm_runner is None:
-            raise RuntimeError("vLLM is not available in the current environment.")
 
         return cls(
             model_path=model_path,
             model=model,
-            tokenizer=tokenizer,
             preprocessor=preprocessor,
-            subtalker_runner=subtalker_runner,
-            vllm_runner=vllm_runner,
+            runner=runner,
             sample_rate=sample_rate,
             device=device,
         )
@@ -110,7 +91,7 @@ class Qwen3TTSAccelPipeline:
             "model_path": self.model_path,
             "sample_rate": self.sample_rate,
             "device": self.device,
-            "main_talker": "vllm_plugin",
+            "main_talker": "direct_sdpa",
             "subtalker": "cuda_graph",
         }
 
@@ -137,19 +118,25 @@ class Qwen3TTSAccelPipeline:
             language=language,
             voice_clone_prompt=voice_clone_prompt,
         )
-        waveforms, sample_rate = self.vllm_runner.synthesize(
-            payload=payload,
-            affect_style={
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "repetition_penalty": repetition_penalty,
-            },
+
+        codec_frames, _ = self.runner.generate(
+            inputs_embeds=payload.inputs_embeds,
+            attention_mask=payload.attention_mask,
+            trailing_text_hidden=payload.trailing_text_hidden,
+            tts_pad_embed=payload.tts_pad_embed,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
         )
-        if not waveforms:
-            raise RuntimeError("No audio was generated.")
-        waveform = _coerce_waveform(waveforms[0])
-        return waveform_to_wav_bytes(waveform, sample_rate)
+
+        if not codec_frames:
+            raise RuntimeError("No codec frames were generated.")
+
+        ref_code = self._get_ref_code(payload.voice_clone_prompt)
+        wavs, sr = self._decode_frames(codec_frames, ref_code)
+        waveform = _coerce_waveform(wavs[0])
+        return waveform_to_wav_bytes(waveform, sr)
 
     def synthesize_stream(
         self,
@@ -175,21 +162,35 @@ class Qwen3TTSAccelPipeline:
             language=language,
             voice_clone_prompt=voice_clone_prompt,
         )
-        for waveforms, _sample_rate in self.vllm_runner.synthesize_stream(
-            payload=payload,
-            affect_style={
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "repetition_penalty": repetition_penalty,
-            },
-            buffer_frames=chunk_size,
+
+        ref_code = self._get_ref_code(payload.voice_clone_prompt)
+
+        # Accumulate all frames then decode once (neural codec uses overlapping
+        # windows, so independent chunk decoding causes boundary artifacts).
+        all_frames: list[list[int]] = []
+        for frame in self.runner.generate_streaming(
+            inputs_embeds=payload.inputs_embeds,
+            attention_mask=payload.attention_mask,
+            trailing_text_hidden=payload.trailing_text_hidden,
+            tts_pad_embed=payload.tts_pad_embed,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
         ):
-            for waveform in waveforms:
-                yield waveform_to_pcm_s16le_bytes(_coerce_waveform(waveform))
+            all_frames.append(frame)
+
+        if all_frames:
+            wavs, _sr = self._decode_frames(all_frames, ref_code)
+            for wav in wavs:
+                yield waveform_to_pcm_s16le_bytes(_coerce_waveform(wav))
 
     def close(self) -> None:
         return None
+
+    # ------------------------------------------------------------------
+    # Voice clone prompt
+    # ------------------------------------------------------------------
 
     def _build_voice_clone_prompt(
         self,
@@ -210,39 +211,63 @@ class Qwen3TTSAccelPipeline:
             raise RuntimeError("Loaded model does not expose create_voice_clone_prompt().")
 
         return builder(
-            reference_audio=ref_audio_path,
-            reference_text=ref_text,
+            ref_audio=ref_audio_path,
+            ref_text=ref_text,
         )
 
+    # ------------------------------------------------------------------
+    # Codec decode (same pattern as DirectTtsBackend._decode_frames)
+    # ------------------------------------------------------------------
 
-def _build_codec_decoder_from_model(model: Any):
-    candidate_paths = [
-        ("speech_tokenizer", "decode"),
-        ("speech_tokenizer", "decode_codec"),
-        ("audio_tokenizer", "decode"),
-        ("codec_decoder", "__call__"),
-    ]
+    def _get_speech_tokenizer(self) -> Any:
+        if hasattr(self.model, "model"):
+            return self.model.model.speech_tokenizer
+        return getattr(self.model, "speech_tokenizer", None)
 
-    for attr_name, method_name in candidate_paths:
-        owner = getattr(model, attr_name, None)
-        if owner is None:
-            continue
-        if method_name == "__call__" and callable(owner):
-            return lambda *, codec_tokens, sample_rate: owner(codec_tokens)
-        method = getattr(owner, method_name, None)
-        if callable(method):
-            if attr_name in {"speech_tokenizer", "audio_tokenizer"}:
-                return lambda *, codec_tokens, sample_rate, _method=method: _decode_with_tokenizer_method(_method, codec_tokens)
-            return lambda *, codec_tokens, sample_rate, _method=method: _method(codec_tokens)
-    return None
+    def _get_ref_code(self, vcp: Any) -> Any:
+        if not isinstance(vcp, dict):
+            return None
+        ref_codes = vcp.get("ref_code")
+        if isinstance(ref_codes, list) and ref_codes and ref_codes[0] is not None:
+            return ref_codes[0]
+        return None
 
+    def _decode_frames(
+        self,
+        codec_frames: list[list[int]],
+        ref_code: Any | None,
+    ) -> tuple[list[Any], int]:
+        import torch
 
-def _decode_with_tokenizer_method(method, codec_tokens):
-    result = method([{"audio_codes": codes} for codes in codec_tokens])
-    if isinstance(result, tuple) and len(result) == 2:
-        wavs, _sample_rate = result
-        return wavs
-    return result
+        speech_tok = self._get_speech_tokenizer()
+        if speech_tok is None:
+            raise RuntimeError("No speech tokenizer available for codec decoding")
+
+        device = next(self.runner._talker.parameters()).device
+        codes_tensor = torch.tensor(codec_frames, device=device, dtype=torch.long)
+
+        if ref_code is not None:
+            ref_code_t = ref_code.to(device) if hasattr(ref_code, "to") else torch.tensor(ref_code, device=device)
+            if ref_code_t.dim() == 1:
+                ref_code_t = ref_code_t.unsqueeze(-1)
+            full_codes = torch.cat([ref_code_t, codes_tensor], dim=0)
+        else:
+            full_codes = codes_tensor
+
+        wavs, sr = speech_tok.decode([{"audio_codes": full_codes}])
+        wav = wavs[0]
+
+        # Trim reference portion
+        if ref_code is not None and full_codes.shape[0] > 0:
+            ref_len = ref_code_t.shape[0]
+            total_len = full_codes.shape[0]
+            cut = int(ref_len / total_len * wav.shape[0])
+            wav = wav[cut:]
+
+        if hasattr(wav, "cpu"):
+            wav = wav.cpu().numpy()
+
+        return [wav], sr
 
 
 def _coerce_waveform(waveform: Any) -> np.ndarray:

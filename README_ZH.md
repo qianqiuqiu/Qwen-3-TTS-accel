@@ -10,67 +10,82 @@
 
 声音这一块一开始用的是 Qwen3-TTS 做克隆，效果其实非常好，出来的声音很像，也很符合我想要的那种昴的感觉。问题出在延迟上，延迟高到根本没法接受。对于桌宠这种东西来说，陪伴感特别依赖实时反馈，结果即使用了流式、做了分句输出，RTF 还是远大于 1，完全不够实时。一句大概 3 秒的话，能生成 7 到 8 秒，沟槽的，我的昴怎么能一句话卡壳这么久。
 
-然后我就开始一点点排查问题，也顺便补了不少 TTS 相关的知识。后来才真正意识到，TTS 的架构和 GPT 那种单一路径生成很不一样，瓶颈主要在 `subtalker` 这部分。说来也挺丢人的，我一个在垃圾公司算法岗实习的垃圾大学生，之前居然对这种 subtalker 竖着自回归预测 token 的结构没什么概念。最开始我的想法是直接重写 vLLM 的调用逻辑，让 `main talker` 和 `subtalker` 都走 vLLM。继续往下看之后发现，`subtalker` 的长度其实是固定的，那就意味着它非常适合用 CUDA Graph 来做加速，而且实现起来比我最开始设想的方案简单得多，也没必要搞得那么大动干戈。
+然后我就开始一点点排查问题，也顺便补了不少 TTS 相关的知识。Qwen3-TTS 的架构是两级的：`main talker`（28 层 transformer，生成粗粒度的 codec token）和 `subtalker`（5 层 code_predictor，对每个粗粒度 token 生成剩余 15 个精细 codebook token）。profile 之后发现 `subtalker` 是主要瓶颈——每帧都要调一次，HF 的 `generate()` 开销叠加得很厉害。
+
+关键发现是 `subtalker` 每次固定解码 15 个 token（每个 codebook 一个）。固定长度解码是 CUDA Graph 的最佳场景——把整个解码循环捕获一次，之后每次回放几乎没有 CPU 调度开销。光这一项就让 sub-talker 快了约 7.5 倍。
+
+对于 `main talker`，HF 的 `generate()` 同样有不必要的开销（DynamicCache 分配、prepare_inputs、每步 _update_model_kwargs）。而且我们本来就需要在 main talker 的每一步之间插入 sub-talker 调用，所以我直接写了一个基于 SDPA 的 runner，用预分配的静态 KV cache 手动驱动 28 层 transformer。这样既去掉了框架开销，又能原地复用 HF 模型的权重，不需要额外拷贝。
 
 最后我觉得，这一部分推理优化本身就已经很值得单独拿出来了，不一定非得依附在原来的桌宠项目里。所以我把相关逻辑重新梳理了一遍，把真正可复用的部分抽出来，就成了现在这个仓库。
 
-`qwen3tts-accel` 是一个面向 **Qwen3-TTS** 的可复用高性能推理核心仓库。
+在我做完这一切之后，我发现开源社区已经有人实现了比我自己匆忙做出来的更完备的几乎同思路的方案了，但做都做了，还是开个仓库存起来。
 
-这个仓库的重点不是完整业务服务，而是把最有价值、最容易复用的优化路径单独抽出来：
+## 这是什么
 
-- `main talker`: 基于 **vLLM** 的自定义插件路径
-- `subtalker`: 基于 **CUDA Graph** 的加速解码
-- `prefill`: 从 Qwen3-TTS 中抽出的预处理逻辑
+`qwen3tts-accel` 是一个面向 **Qwen3-TTS** 的可复用高性能推理核心。
 
-仓库中附带了一个非常薄的 HTTP API，只用于：
+这个仓库的重点不是完整业务服务，而是把让 Qwen3-TTS 跑到实时的优化技术单独抽出来分享：
 
-- 验证这条推理链可以独立工作
-- 给外部系统提供最小接入样例
-- 方便后续二次封装成自己的服务
+| 组件 | 位置 | 作用 |
+|------|------|------|
+| **CUDA Graph sub-talker** | `subtalker/cuda_graph.py` | 把 5 层 code_predictor 的 15 步解码捕获为 CUDA graph。比 HF generate 快 ~7.5 倍。 |
+| **Direct SDPA main talker** | `direct/main_talker_runner.py` | 手动管理 KV cache + SDPA 驱动 28 层 main talker，完全绕过 HF generate() 开销。 |
+| **vLLM 插件**（框架代码） | `vllm/plugin.py` | 在 vLLM PagedAttention 上重新实现 main talker。为未来 vLLM 集成准备的框架代码。 |
+| **预处理器** | `preprocess/preprocessor.py` | 构造优化路径所需的 `inputs_embeds`、`trailing_text_hidden`、`tts_pad_embed`。 |
 
-它不是这个项目的核心价值，也不是要覆盖完整生产业务能力的服务层。
+默认推理路径使用 **Direct SDPA + CUDA Graph sub-talker**（运行时不依赖 vLLM）。
 
-## 仓库保留了什么
+仓库附带一个薄的 HTTP API，仅用于验证优化推理链路和提供最小接入样例。
 
-- Qwen3-TTS 输入构造与 prefill 逻辑
-- vLLM `main talker` 集成
-- CUDA Graph `subtalker` 加速
-- codec frame 收集与解码
-- 同步与流式音频输出路径
+## 已验证环境
 
-如果你要做上传接口、声音库、鉴权、存储、任务编排，这些都建议在当前推理核心外面再包一层服务。
+以下版本组合已经端到端跑通：
 
-## 最小 API
-
-当前仓库只提供最基础的验证接口：
-
-- `GET /health`
-- `GET /meta`
-- `POST /v1/audio/speech`
-- `POST /v1/audio/speech/stream`
-
-其中：
-
-- `/v1/audio/speech` 返回完整 `audio/wav`
-- `/v1/audio/speech/stream` 返回流式二进制音频块
+| 组件 | 版本 |
+|------|------|
+| Python | 3.10 |
+| PyTorch | 2.10.0+cu128 |
+| CUDA | 12.8 |
+| transformers | 4.57.3 |
+| qwen-tts | 0.1.1 |
+| accelerate | 1.12.0 |
+| GPU | NVIDIA A100 80GB |
 
 ## 安装
 
 ```bash
-pip install -e ".[vllm,dev]"
+pip install -e ".[dev]"
 ```
 
-## 环境说明
+## Docker
 
-这个项目依赖面向 GPU 的运行时环境。实际部署时，下面这些组件的可用版本组合根据目标机器单独确认：
+```bash
+docker build -t qwen3tts-accel .
 
-- NVIDIA 驱动版本
-- CUDA 版本
-- PyTorch 版本
-- vLLM 版本
-- `qwen_tts` 版本
-- `transformers` 版本
+docker run --gpus all -p 8000:8000 \
+  -v /path/to/Qwen3-TTS-12Hz-1.7B-Base:/model \
+  qwen3tts-accel
+```
 
+## 快速上手（Python）
+
+```python
+from qwen3tts_accel.pipeline import Qwen3TTSAccelPipeline
+
+pipe = Qwen3TTSAccelPipeline.from_pretrained(
+    model_path="/path/to/Qwen3-TTS-12Hz-1.7B-Base",
+)
+
+wav_bytes = pipe.synthesize(
+    text="你好，这是一个测试。",
+    language="Chinese",
+    ref_audio_path="/path/to/ref.wav",
+    ref_text="参考音频对应的文本。",
+)
+
+with open("out.wav", "wb") as f:
+    f.write(wav_bytes)
+```
 
 ## 启动最小 API
 
@@ -81,24 +96,20 @@ python -m qwen3tts_accel.api_server \
   --port 8000
 ```
 
-可选鉴权：
+可选参数：
 
-```bash
-python -m qwen3tts_accel.api_server \
-  --model-path /path/to/Qwen3-TTS-12Hz-1.7B-Base \
-  --port 8000 \
-  --api-key your-secret
-```
+- `--max-seq-len`（默认 4096）：KV cache 最大长度
+- `--no-cuda-graph-subtalker`：关闭 sub-talker 的 CUDA graph 加速
+- `--api-key`：可选的 Bearer token 鉴权
 
-如果设置了 `--api-key`，客户端需要携带：
+## API 接口
 
-```http
-Authorization: Bearer your-secret
-```
+- `GET /health` — 返回 `{"status": "ok"}`
+- `GET /meta` — 返回模型元信息
+- `POST /v1/audio/speech` — 完整合成，返回 `audio/wav`
+- `POST /v1/audio/speech/stream` — 流式合成，返回 PCM 音频块
 
 ## 最小请求示例
-
-当前接口按请求传入参考音频路径与参考文本，适合作为最基础的声音克隆验证入口。
 
 ```python
 import requests
@@ -125,26 +136,28 @@ with open("out.wav", "wb") as f:
 
 ```text
 qwen3tts_accel/
-├── api_server.py
-├── pipeline.py
-├── schemas.py
-├── auth.py
-├── audio.py
-├── preprocess/
-├── subtalker/
-├── vllm/
-├── decode/
-├── state/
-└── benchmarks/
+├── api_server.py          # 薄 FastAPI 服务，仅用于验证
+├── pipeline.py            # 主流水线（Direct SDPA + CUDA Graph）
+├── schemas.py             # 请求/响应模型
+├── auth.py                # 可选 Bearer token 鉴权
+├── audio.py               # WAV/PCM 编码工具
+├── preprocess/            # Qwen3-TTS 输入构造
+├── direct/                # Direct SDPA main talker runner
+├── subtalker/             # CUDA Graph sub-talker 加速
+├── vllm/                  # vLLM 插件（框架代码，供未来使用）
+├── decode/                # Codec 解码辅助
+├── state/                 # 序列状态管理
+└── benchmarks/            # 计时工具
 ```
 
-## 使用建议
+## 怎么读这个项目
 
-如果你的目标是复用 Qwen3-TTS 的高性能推理能力，那么当前仓库已经足够：
+如果你想理解或复用这些优化：
 
-- 核心推理路径已经抽离
-- 最小 API 已经可用于联调和验证
-- 外围服务能力可以按你的业务需求自由扩展
+1. 先看 `subtalker/cuda_graph.py` — 5 层 code_predictor 的 CUDA Graph 捕获/回放逻辑
+2. 再看 `direct/main_talker_runner.py` — 28 层 main talker 的手动 KV cache + SDPA
+3. 然后是 `preprocess/preprocessor.py` — Qwen3-TTS 输入是怎么构造的
+4. `vllm/plugin.py` 作为 vLLM 集成的参考框架
 
 ## License
 

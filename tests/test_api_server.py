@@ -16,7 +16,7 @@ class RecordingPipeline:
             "model_path": "/models/qwen3",
             "sample_rate": 24000,
             "device": "cuda:0",
-            "main_talker": "vllm_plugin",
+            "main_talker": "direct_sdpa",
             "subtalker": "cuda_graph",
         }
 
@@ -47,7 +47,7 @@ def test_meta_endpoint_uses_pipeline_metadata():
     response = client.get("/meta")
 
     assert response.status_code == 200
-    assert response.json()["main_talker"] == "vllm_plugin"
+    assert response.json()["main_talker"] == "direct_sdpa"
     assert response.json()["subtalker"] == "cuda_graph"
 
 

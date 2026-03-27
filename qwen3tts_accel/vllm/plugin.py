@@ -98,9 +98,10 @@ class Qwen3TTSTalkerAttention(nn.Module):
             max_position=max_pos,
             is_neox_style=True,
             rope_parameters={
-                "rope_type": "mrope_interleaved" if interleaved else "mrope",
+                "rope_type": "default",
                 "factor": 1.0,
                 "mrope_section": mrope_section,
+                "mrope_interleaved": interleaved,
                 "base": rope_theta,
             },
             dtype=torch.get_default_dtype(),
@@ -155,14 +156,14 @@ class Qwen3TTSTalkerMLP(nn.Module):
     ) -> None:
         super().__init__()
         from vllm.model_executor.layers.linear import (
-            ColumnParallelLinear,
+            MergedColumnParallelLinear,
             RowParallelLinear,
         )
         from vllm.model_executor.layers.activation import SiluAndMul
 
-        self.gate_up_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            2 * intermediate_size,
+            [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
@@ -286,12 +287,12 @@ class Qwen3TTSForVLLM(nn.Module):
         # Transformer layers
         self.start_layer, self.end_layer, self.layers = make_layers(
             talker_cfg.num_hidden_layers,
-            lambda pfx: Qwen3TTSTalkerDecoderLayer(
+            lambda prefix: Qwen3TTSTalkerDecoderLayer(
                 config=talker_cfg,
-                layer_idx=int(pfx.rsplit(".", 1)[-1]),
+                layer_idx=int(prefix.rsplit(".", 1)[-1]),
                 cache_config=cache_config,
                 quant_config=quant_config,
-                prefix=pfx,
+                prefix=prefix,
             ),
             prefix=f"{prefix}.model.layers" if prefix else "model.layers",
         )
@@ -323,6 +324,10 @@ class Qwen3TTSForVLLM(nn.Module):
         self.text_projection_fc1 = nn.Linear(text_hidden, text_hidden, bias=True)
         self.text_projection_fc2 = nn.Linear(text_hidden, talker_cfg.hidden_size, bias=True)
         self._text_proj_act = nn.SiLU()
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Required by vLLM >= 0.17 for text generation models."""
+        return self.codec_embedding(input_ids)
 
     def set_subtalker(self, runner: Any) -> None:
         """Set the CUDA graph sub-talker runner."""
@@ -435,8 +440,12 @@ class Qwen3TTSForVLLM(nn.Module):
                     if target_name in params_dict:
                         param = params_dict[target_name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                        weight_loader(param, loaded_weight, shard_id)
-                        loaded.add(f"talker.{name}")
+                        try:
+                            weight_loader(param, loaded_weight, shard_id)
+                        except TypeError:
+                            # v1 API fallback
+                            default_weight_loader(param, loaded_weight)
+                        loaded.add(target_name)
                         is_stacked = True
                     break
 
@@ -448,7 +457,7 @@ class Qwen3TTSForVLLM(nn.Module):
                 param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded.add(f"talker.{name}")
+                loaded.add(mapped_name)
             else:
                 logger.debug("Skipping unmapped talker weight: %s -> %s", name, mapped_name)
 
